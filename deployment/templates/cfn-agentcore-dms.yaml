@@ -1,0 +1,1580 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DMS Migration with S3 and AgentCore DMS Management Agent'
+
+Parameters:
+  # Source Database Parameters
+  SourceEngine:
+    Type: String
+    AllowedValues: [postgres, mysql, aurora-postgresql, aurora, mariadb]
+    Description: Source database engine type
+  
+  SourceSecretArn:
+    Type: String
+    Description: ARN of AWS Secrets Manager secret containing source database credentials
+  
+  SourceDatabaseName:
+    Type: String
+    Description: Source database name
+  
+  SourceDatabasePort:
+    Type: Number
+    Default: 5432
+  
+  SourceDatabaseCIDR:
+    Type: String
+    Description: Source database VPC CIDR block for DMS security group ingress. Required only if creating new DMS security group.
+  
+  SourceDBSchema:
+    Type: String
+    Default: public
+    Description: Source database schema name. For PostgreSQL/Aurora PostgreSQL - enter schema name (e.g., public). For MySQL/MariaDB/Aurora MySQL - use same value as SourceDatabaseName
+  
+  # DMS Replication Instance Parameters
+  ExistingReplicationInstanceArn:
+    Type: String
+    Default: ''
+    Description: (Optional) Existing DMS Replication Instance ARN
+  
+  ReplicationInstanceClass:
+    Type: String
+    Default: dms.t3.medium
+    AllowedValues: [dms.t3.micro, dms.t3.small, dms.t3.medium, dms.t3.large, dms.c5.large, dms.c5.xlarge, dms.c5.2xlarge]
+    Description: DMS replication instance class - only used when creating new replication instance
+  
+  ReplicationInstanceStorage:
+    Type: Number
+    Default: 50
+    MinValue: 5
+    MaxValue: 6144
+    Description: Allocated storage in GB - only used when creating new replication instance
+  
+  ReplicationInstanceEngineVersion:
+    Type: String
+    Default: ''
+    Description: (Optional) DMS engine version (e.g., 3.6.1). Leave empty for latest version.
+  
+  # DMS VPC Parameters
+  DMSVpcId:
+    Type: String
+    Default: ''
+    Description: (Optional) VPC ID for DMS - not required if using existing replication instance
+  
+  DMSSubnetId1:
+    Type: String
+    Default: ''
+    Description: (Optional) First subnet ID for DMS - not required if using existing replication instance
+  
+  DMSSubnetId2:
+    Type: String
+    Default: ''
+    Description: (Optional) Second subnet ID for DMS - not required if using existing replication instance
+  
+  DMSSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: (Optional) Security group ID for DMS - not required if using existing replication instance
+  
+  DMSRouteTableIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: (Optional) Private route table IDs for S3 VPC endpoint when using existing VPC. Only attach to route tables where DMS and Lambda resources are deployed (comma-delimited).
+  
+  CreateS3VPCEndpoint:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create S3 VPC endpoint. Set to false if S3 endpoint already exists in your VPC.
+  
+  # Lambda VPC Parameters
+  LambdaVpcId:
+    Type: String
+    Description: VPC ID for Lambda functions
+  
+  LambdaSubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs for Lambda functions (comma-delimited)
+  
+  LambdaSecurityGroupId:
+    Type: String
+    Description: Security group ID for Lambda functions
+  
+  # Lambda Layer Parameters
+  PsycopgLayerArn:
+    Type: String
+    Default: ''
+    Description: Required for PostgreSQL source and DSQL target
+  
+  PymysqlLayerArn:
+    Type: String
+    Default: ''
+    Description: Required for MySQL/MariaDB source
+  
+  # Target Aurora DSQL Parameters
+  TargetSecretArn:
+    Type: String
+    Description: ARN of AWS Secrets Manager secret containing Aurora DSQL configuration (endpoint, database, schema, username)
+  
+  TargetRegion:
+    Type: String
+    Default: us-east-1
+    Description: Target Aurora DSQL region
+
+  # S3 Target Parameters
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: S3 bucket name for DMS target (leave empty to auto-generate)
+  
+  S3BucketPrefix:
+    Type: String
+    Default: 'dms-cdc/'
+    Description: S3 prefix for DMS CDC files
+  
+  # AgentCore Configuration
+  AgentCoreName:
+    Type: String
+    Default: "dmsagent"
+    Description: "Name for the AgentCore agent"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{0,47}$"
+
+  ImageTag:
+    Type: String
+    Default: "latest"
+    Description: "Tag for the Docker image"
+
+  NetworkMode:
+    Type: String
+    Default: "PUBLIC"
+    Description: "Network mode for AgentCore resources"
+    AllowedValues:
+      - PUBLIC
+      - VPC
+  
+  # AgentCore VPC Parameters (required for VPC mode)
+  AgentCoreVpcId:
+    Type: String
+    Default: ''
+    Description: (Optional) VPC ID for AgentCore - required if NetworkMode is VPC
+  
+  AgentCoreSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: (Optional) Subnet IDs for AgentCore (comma-delimited) - required if NetworkMode is VPC
+  
+  AgentCoreSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: (Optional) Security group for AgentCore - required if NetworkMode is VPC
+  
+  FoundationModelId:
+    Type: String
+    Description: Foundation model ID or inference profile ARN
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+Conditions:
+  CreateReplicationInstance: !Equals [!Ref ExistingReplicationInstanceArn, '']
+  CreateVPC: !And
+    - !Equals [!Ref DMSVpcId, '']
+    - !Equals [!Ref ExistingReplicationInstanceArn, '']
+  CreateSecurityGroup: !And
+    - !Equals [!Ref DMSSecurityGroupId, '']
+    - !Equals [!Ref ExistingReplicationInstanceArn, '']
+  IsPostgreSQL: !Or [!Equals [!Ref SourceEngine, 'postgres'], !Equals [!Ref SourceEngine, 'aurora-postgresql']]
+  IsMySQL: !Or [!Equals [!Ref SourceEngine, 'mysql'], !Equals [!Ref SourceEngine, 'aurora'], !Equals [!Ref SourceEngine, 'mariadb']]
+  UsePsycopgLayer: !And [!Condition IsPostgreSQL, !Not [!Equals [!Ref PsycopgLayerArn, '']]]
+  UsePymysqlLayer: !And [!Condition IsMySQL, !Not [!Equals [!Ref PymysqlLayerArn, '']]]
+  UseEngineVersion: !Not [!Equals [!Ref ReplicationInstanceEngineVersion, '']]
+  IsFullArn: !Equals [!Select [0, !Split [":", !Ref FoundationModelId]], "arn"]
+  IsInferenceProfile: !Or
+    - !Equals [!Select [0, !Split [".", !Ref FoundationModelId]], "us"]
+    - !Equals [!Select [0, !Split [".", !Ref FoundationModelId]], "eu"]
+  UseCustomS3Bucket: !Not [!Equals [!Ref S3BucketName, '']]
+  HasRouteTableIds: !Not [!Equals [!Join ['', !Ref DMSRouteTableIds], '']]
+  ShouldCreateS3Endpoint: !And
+    - !Equals [!Ref CreateS3VPCEndpoint, 'true']
+    - !Or [!Condition CreateVPC, !Condition HasRouteTableIds]
+  UsePrivateNetwork: !Equals [!Ref NetworkMode, 'VPC']
+
+
+Resources:
+
+  # SECURITY SECTION - KMS
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting S3, logs, and ECR
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Service Usage
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService':
+                  - !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                  - !Sub 'logs.${AWS::Region}.amazonaws.com'
+                  - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+                  - !Sub 'ecr.${AWS::Region}.amazonaws.com'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Sid: Allow S3
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-encryption-key'
+      TargetKeyId: !Ref EncryptionKey
+
+
+  # VPC AND NETWORKING SECTION 
+
+  DMSVPC:
+    Type: AWS::EC2::VPC
+    Condition: CreateVPC
+    Properties:
+      CidrBlock: 10.100.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: DMS-Migration-VPC
+  
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref DMSVPC
+      CidrBlock: 10.100.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: DMS-Public-Subnet
+  
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref DMSVPC
+      CidrBlock: 10.100.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: DMS-Private-Subnet-1
+  
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref DMSVPC
+      CidrBlock: 10.100.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: DMS-Private-Subnet-2
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: DMS-IGW
+  
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref DMSVPC
+      InternetGatewayId: !Ref InternetGateway
+  
+  EIP:
+    Type: AWS::EC2::EIP
+    Condition: CreateVPC
+    Properties:
+      Domain: vpc
+  
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateVPC
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: DMS-NAT-Gateway
+  
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref DMSVPC
+      Tags:
+        - Key: Name
+          Value: DMS-Public-RT
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVPC
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref DMSVPC
+      Tags:
+        - Key: Name
+          Value: DMS-Private-RT
+  
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVPC
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+  
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+  
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateS3Endpoint
+    Properties:
+      VpcId: !If [CreateVPC, !Ref DMSVPC, !Ref DMSVpcId]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: !If
+        - CreateVPC
+        - - !Ref PrivateRouteTable
+          - !Ref PublicRouteTable
+        - !Ref DMSRouteTableIds
+
+  DMSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateSecurityGroup
+    Properties:
+      GroupDescription: DMS Replication Instance Security Group
+      VpcId: !If [CreateVPC, !Ref DMSVPC, !Ref DMSVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref SourceDatabasePort
+          ToPort: !Ref SourceDatabasePort
+          CidrIp: !Ref SourceDatabaseCIDR
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: DMS-SecurityGroup
+
+ 
+  # DMS SECTION
+
+  DMSSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Condition: CreateReplicationInstance
+    Properties:
+      ReplicationSubnetGroupDescription: DMS Subnet Group
+      SubnetIds:
+        - !If [CreateVPC, !Ref PrivateSubnet1, !Ref DMSSubnetId1]
+        - !If [CreateVPC, !Ref PrivateSubnet2, !Ref DMSSubnetId2]
+  
+  DMSVPCRole:
+    Type: AWS::IAM::Role
+    Condition: CreateReplicationInstance
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+  
+  DMSCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Condition: CreateReplicationInstance
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
+  
+  DMSReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Condition: CreateReplicationInstance
+    DependsOn: [DMSVPCRole, DMSCloudWatchLogsRole]
+    Properties:
+      ReplicationInstanceIdentifier: !Sub 'dms-replication-${AWS::StackName}'
+      ReplicationInstanceClass: !Ref ReplicationInstanceClass
+      AllocatedStorage: !Ref ReplicationInstanceStorage
+      EngineVersion: !If [UseEngineVersion, !Ref ReplicationInstanceEngineVersion, !Ref 'AWS::NoValue']
+      VpcSecurityGroupIds:
+        - !If [CreateSecurityGroup, !Ref DMSSecurityGroup, !Ref DMSSecurityGroupId]
+      ReplicationSubnetGroupIdentifier: !Ref DMSSubnetGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+  
+  DMSSecretsManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - dms.amazonaws.com
+                - !Sub 'dms.${AWS::Region}.amazonaws.com'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Ref SourceSecretArn
+                  - !Ref TargetSecretArn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt EncryptionKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                  StringLike:
+                    'kms:EncryptionContext:SecretARN': !Ref SourceSecretArn
+  
+  DMSSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub 'source-${AWS::StackName}'
+      EndpointType: source
+      EngineName: !Ref SourceEngine
+      DatabaseName: !If [IsPostgreSQL, !Ref SourceDatabaseName, !Ref 'AWS::NoValue']
+      PostgreSqlSettings: !If
+        - IsPostgreSQL
+        - SecretsManagerAccessRoleArn: !GetAtt DMSSecretsManagerRole.Arn
+          SecretsManagerSecretId: !Ref SourceSecretArn
+        - !Ref 'AWS::NoValue'
+      MySqlSettings: !If
+        - IsMySQL
+        - SecretsManagerAccessRoleArn: !GetAtt DMSSecretsManagerRole.Arn
+          SecretsManagerSecretId: !Ref SourceSecretArn
+        - !Ref 'AWS::NoValue'
+  
+  DMSS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If [UseCustomS3Bucket, !Ref S3BucketName, !Sub '${AWS::StackName}-dms-target-${AWS::AccountId}']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCDCFiles
+            Status: Enabled
+            ExpirationInDays: 30
+
+  
+  DMSS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:PutObjectTagging
+                Resource: !Sub '${DMSS3Bucket.Arn}/${S3BucketPrefix}*'
+              
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !GetAtt DMSS3Bucket.Arn
+              
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt EncryptionKey.Arn
+  DMSTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub 's3-target-${AWS::StackName}'
+      EndpointType: target
+      EngineName: s3
+      S3Settings:
+        BucketName: !Ref DMSS3Bucket
+        BucketFolder: !Ref S3BucketPrefix
+        ServiceAccessRoleArn: !GetAtt DMSS3Role.Arn
+        DataFormat: csv
+        CompressionType: gzip
+        EnableStatistics: true
+        IncludeOpForFullLoad: true
+        CdcInsertsAndUpdates: true
+        TimestampColumnName: dms_timestamp
+        AddColumnName: true
+        CdcPath: 'cdc'
+        EncryptionMode: SSE_KMS
+        ServerSideEncryptionKmsKeyId: !GetAtt EncryptionKey.Arn
+  
+  DMSReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub 'migration-task-${AWS::StackName}'
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TargetEndpointArn: !Ref DMSTargetEndpoint
+      ReplicationInstanceArn: !If [CreateReplicationInstance, !Ref DMSReplicationInstance, !Ref ExistingReplicationInstanceArn]
+      MigrationType: full-load-and-cdc
+      TableMappings: !Sub |
+        {
+          "rules": [
+            {
+              "rule-type": "selection",
+              "rule-id": "1",
+              "rule-name": "1",
+              "object-locator": {
+                "schema-name": "${SourceDBSchema}",
+                "table-name": "%"
+              },
+              "rule-action": "include"
+            }
+          ]
+        }
+      ReplicationTaskSettings: |
+        {
+          "TargetMetadata": {
+            "SupportLobs": true,
+            "FullLobMode": false,
+            "LobChunkSize": 64,
+            "LimitedSizeLobMode": true,
+            "LobMaxSize": 32
+          },
+          "FullLoadSettings": {
+            "TargetTablePrepMode": "DROP_AND_CREATE",
+            "CreatePkAfterFullLoad": false,
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8,
+            "TransactionConsistencyTimeout": 600,
+            "CommitRate": 10000
+          },
+          "Logging": {
+            "EnableLogging": true,
+            "LogComponents": [
+              {
+                "Id": "TRANSFORMATION",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              },
+              {
+                "Id": "SOURCE_UNLOAD",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              },
+              {
+                "Id": "TARGET_LOAD",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              }
+            ]
+          },
+          "ChangeProcessingDdlHandlingPolicy": {
+            "HandleSourceTableDropped": true,
+            "HandleSourceTableTruncated": true,
+            "HandleSourceTableAltered": true
+          },
+          "ChangeProcessingTuning": {
+            "BatchApplyPreserveTransaction": true,
+            "BatchApplyTimeoutMin": 1,
+            "BatchApplyTimeoutMax": 30,
+            "BatchApplyMemoryLimit": 500,
+            "BatchSplitSize": 0,
+            "MinTransactionSize": 1000,
+            "CommitTimeout": 1,
+            "MemoryLimitTotal": 1024,
+            "MemoryKeepTime": 60,
+            "StatementCacheSize": 50
+          }
+        }
+
+
+  # S3 Processor Lambda
+
+  S3ProcessorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: LambdaS3AuroraDSQL
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DMSS3Bucket.Arn
+                  - !Sub '${DMSS3Bucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource: !Sub 'arn:aws:dsql:${TargetRegion}:${AWS::AccountId}:cluster/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*" 
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Ref SourceSecretArn
+                  - !Ref TargetSecretArn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+  
+  DMSS3ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dms-s3-processor'
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt S3ProcessorExecutionRole.Arn
+      Timeout: 300
+      ReservedConcurrentExecutions: 50
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref LambdaSubnetIds
+      Environment:
+        Variables:
+          DSQL_SECRET_ARN: !Ref TargetSecretArn
+          SOURCE_DB_SCHEMA: !Ref SourceDBSchema
+          SOURCE_DB_SECRET_ARN: !Ref SourceSecretArn
+          ENABLE_UUID_CONVERSION: 'true'
+          SCHEMA_VERSION: '1'
+      Layers:
+        - !Ref PsycopgLayerArn
+        - !If [IsMySQL, !Ref PymysqlLayerArn, !Ref 'AWS::NoValue']
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              print("Placeholder - Update with DMS S3 processor code")
+              print(f"S3 Event: {event}")
+              return {'statusCode': 200, 'body': 'Update function code'}
+              
+  S3LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DMSS3ProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DMSS3Bucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  S3BucketNotificationConfig:
+    Type: Custom::S3BucketNotification
+    DependsOn: S3LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationConfigFunction.Arn
+      BucketName: !Ref DMSS3Bucket
+      LambdaFunctionArn: !GetAtt DMSS3ProcessorFunction.Arn
+      Prefix: !Ref S3BucketPrefix
+
+  S3NotificationConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3-notification-config'
+      Runtime: python3.14
+      Handler: index.handler
+      Role: !GetAtt S3NotificationConfigRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, logging
+          import cfnresponse
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client('s3')
+          
+          def handler(event, context):
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  lambda_arn = event['ResourceProperties']['LambdaFunctionArn']
+                  prefix = event['ResourceProperties']['Prefix']
+                  
+                  if event['RequestType'] == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration={
+                          'LambdaFunctionConfigurations': [{
+                              'LambdaFunctionArn': lambda_arn,
+                              'Events': ['s3:ObjectCreated:*'],
+                              'Filter': {
+                                  'Key': {
+                                      'FilterRules': [{'Name': 'prefix', 'Value': prefix}]
+                                  }
+                              }
+                          }]
+                      }
+                  )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  S3NotificationConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !GetAtt DMSS3Bucket.Arn
+
+
+  # DMS Agent Lambda Function
+
+  DMSAgentLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dms-agent-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DMSAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*"
+              - Effect: Allow
+                Action:
+                  - dms:DescribeReplicationTasks
+                Resource: !Sub 'arn:aws:dms:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - dms:StartReplicationTask
+                  - dms:StopReplicationTask
+                Resource: !Ref DMSReplicationTask
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Ref SourceSecretArn
+                  - !Ref TargetSecretArn
+              - Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource: !Sub 'arn:aws:dsql:${TargetRegion}:${AWS::AccountId}:cluster/*'
+  
+  DMSAgentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dms-agent-lambda'
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt DMSAgentLambdaExecutionRole.Arn
+      ReservedConcurrentExecutions: 10
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # PLACEHOLDER: Replace with actual Lambda function code
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': 'Lambda function placeholder - replace with actual code'
+              }
+      Environment:
+        Variables:
+          DMS_TASK_ARN: !Ref DMSReplicationTask
+          SOURCE_SECRET_ARN: !Ref SourceSecretArn
+          DSQL_SECRET_ARN: !Ref TargetSecretArn
+          SOURCE_SCHEMA: !Ref SourceDBSchema
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Select [0, !Ref LambdaSubnetIds]
+      Layers:
+        - !Ref PsycopgLayerArn
+        - !If [IsMySQL, !Ref PymysqlLayerArn, !Ref 'AWS::NoValue']
+
+
+  # AgentCore ECR Repository
+
+  AgentCoreECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-${AgentCoreName}"
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt EncryptionKey.Arn
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+
+  # AgentCore IAM Roles
+
+  AgentCoreExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-agentcore-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess
+      Policies:
+        - PolicyName: AgentCoreExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRImageAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetAuthorizationToken
+                Resource: 
+                  - !GetAtt AgentCoreECRRepository.Arn
+                  - "*"
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+              - Sid: LambdaInvocation
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DMSAgentLambda.Arn
+
+  AgentCoreCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-agentcore-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*"
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+              - Sid: ECRAuthToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRRepositoryAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt AgentCoreECRRepository.Arn
+
+  AgentCoreCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-agentcore-custom-resource-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CustomResourcePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CodeBuildAccess
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt AgentCoreImageBuildProject.Arn
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+
+  # AgentCore Custom Resource Lambda
+
+  AgentCoreCodeBuildTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-agentcore-codebuild-trigger"
+      Handler: index.handler
+      Role: !GetAtt AgentCoreCustomResourceRole.Arn
+      ReservedConcurrentExecutions: 5
+      Runtime: python3.14
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3, json, logging, time
+          import cfnresponse
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def handler(event, context):
+              logger.info('Received event: %s', json.dumps(event))
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  project_name = event['ResourceProperties']['ProjectName']
+                  codebuild = boto3.client('codebuild')
+                  response = codebuild.start_build(projectName=project_name)
+                  build_id = response['build']['id']
+                  logger.info(f"Started build: {build_id}")
+                  
+                  max_wait_time = context.get_remaining_time_in_millis() / 1000 - 30
+                  start_time = time.time()
+                  
+                  while True:
+                      if time.time() - start_time > max_wait_time:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': 'Build timeout'})
+                          return
+                      
+                      build_response = codebuild.batch_get_builds(ids=[build_id])
+                      build_status = build_response['builds'][0]['buildStatus']
+                      
+                      if build_status == 'SUCCEEDED':
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {'BuildId': build_id})
+                          return
+                      elif build_status in ['FAILED', 'FAULT', 'STOPPED', 'TIMED_OUT']:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': f'Build failed: {build_status}'})
+                          return
+                      
+                      time.sleep(30)
+              except Exception as e:
+                  logger.error('Error: %s', str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+
+  # AgentCore CodeBuild Project
+
+  AgentCoreImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-${AgentCoreName}-build"
+      EncryptionKey: !GetAtt EncryptionKey.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${AWS::StackName}-${AgentCoreName}-build'
+      ServiceRole: !GetAtt AgentCoreCodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref AgentCoreECRRepository
+          - Name: IMAGE_TAG
+            Value: !Ref ImageTag
+          - Name: DMS_LAMBDA_ARN
+            Value: !GetAtt DMSAgentLambda.Arn
+          - Name: FOUNDATION_MODEL_ID
+            Value: !If
+              - IsFullArn
+              - !Ref FoundationModelId
+              - !If
+                - IsInferenceProfile
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${FoundationModelId}'
+                - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${FoundationModelId}'
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - echo Building DMS AgentCore Agent...
+                - |
+                  cat > requirements.txt << 'EOF'
+                  strands-agents
+                  strands-agents-tools
+                  boto3
+                  bedrock-agentcore
+                  bedrock-agentcore-starter-toolkit
+                  pydantic
+                  python-dotenv
+                  EOF
+                
+                - |
+                  cat > dms_agent.py << 'AGENTEOF'
+                  from strands.telemetry import StrandsTelemetry
+                  from strands.types.content import Message
+                  from strands.models import BedrockModel
+                  from strands.agent.conversation_manager import SlidingWindowConversationManager
+                  from strands import Agent, tool
+                  import json, sys, os, re, io, uuid, asyncio, boto3
+                  from typing import Union, Optional, Annotated, Dict, List, Any, Literal
+                  from pydantic import BaseModel, Field
+                  from dotenv import load_dotenv
+                  from bedrock_agentcore.runtime.context import RequestContext
+                  from bedrock_agentcore import BedrockAgentCoreApp
+                  
+                  load_dotenv()
+                  app = BedrockAgentCoreApp()
+                  sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+                  
+                  REGION = os.getenv('AWS_REGION', 'us-east-1')
+                  MODEL_ID = os.getenv('FOUNDATION_MODEL_ID')
+                  LAMBDA_ARN = os.getenv('DMS_LAMBDA_ARN')
+                  
+                  llm_ORCHESTRATION = BedrockModel(model_id=MODEL_ID, region_name=REGION, temperature=0, max_tokens=16384, stop_sequences=['</answer>'], top_k=250)
+                  
+                  ORCHESTRATION_TEMPLATE = """
+                  $$You are a DMS (Database Migration Service) management assistant. You can start/stop DMS replication tasks and validate data between source and target Aurora DSQL databases. Use the available functions to help users manage their data migration and validation tasks.$$ You are a helpful assistant with tool/function calling capabilities. If you need an input parameter for a tool/function, ask the user to provide that parameter before making a call to that function/tool. You will have access to a separate tool/function that you MUST use to ask questions to the user. Never call a tool/function before gathering all parameters required for the tool/function call. It is your responsibility to pick the correct tools/functions that are going to help you answer the user questions. Continue using the provided tools/functions until the initial user request is perfectly addressed. If you do not have the necessary tools/functions to address the initial request, call it out and terminate conversation. When you receive a tool/function call response, use the output to format an answer to the original user question. Provide your final answer to the user's question within <answer></answer> xml tags. I have also provided default values for the following arguments to use within the functions that are available to you:
+                  <provided_argument_values>
+                  $$attributes$$
+                  </provided_argument_values>
+                  Please use these default values for the specified arguments whenever you call the relevant functions. A value may have to be reformatted to correctly match the input format the function specification requires (e.g. changing a date to match the correct date format).
+                  """
+                  
+                  class DmsActionsStartDmsPostApplicationJson(BaseModel):
+                      content_type_annotation: Literal["application/json"]
+                      start_type: Optional[str] = Field(None, description="Start type: 'start', 'restart' or 'reload' for full reload; 'resume' or 'continue' to continue from last position (default: restart)")
+                  
+                  @tool(inputSchema=DmsActionsStartDmsPostApplicationJson.model_json_schema())
+                  def dms_actions_start_dms_post(content_type_annotation: str, start_type: Optional[str] = None) -> str:
+                      lambda_client = boto3.client('lambda', region_name=REGION)
+                      model_dump = {"content_type_annotation": content_type_annotation}
+                      if start_type:
+                          model_dump["start_type"] = start_type
+                      request_body = {"content": {"application/json": {"properties": []}}}
+                      for param_name, param_value in model_dump.items():
+                          if param_name != "content_type_annotation":
+                              request_body["content"]["application/json"]["properties"].append({"name": param_name, "value": param_value})
+                      try:
+                          payload = {"messageVersion": "1.0", "agent": {"name": "dms_management_agent", "id": "AGENTCORE", "alias": "LATEST", "version": "DRAFT"}, "sessionId": "", "sessionAttributes": {}, "promptSessionAttributes": {}, "actionGroup": "dms_actions", "apiPath": "/start-dms", "inputText": last_input, "httpMethod": "POST", "parameters": [], "requestBody": request_body}
+                          response = lambda_client.invoke(FunctionName=LAMBDA_ARN, InvocationType='RequestResponse', Payload=json.dumps(payload))
+                          return str(json.loads(response['Payload'].read().decode('utf-8')))
+                      except Exception as e:
+                          return f"Error executing start_dms/post: {str(e)}"
+                  
+                  @tool()
+                  def dms_actions_stop_dms_post() -> str:
+                      lambda_client = boto3.client('lambda', region_name=REGION)
+                      try:
+                          payload = {"messageVersion": "1.0", "agent": {"name": "dms_management_agent", "id": "AGENTCORE", "alias": "LATEST", "version": "DRAFT"}, "sessionId": "", "sessionAttributes": {}, "promptSessionAttributes": {}, "actionGroup": "dms_actions", "apiPath": "/stop-dms", "inputText": last_input, "httpMethod": "POST", "parameters": []}
+                          response = lambda_client.invoke(FunctionName=LAMBDA_ARN, InvocationType='RequestResponse', Payload=json.dumps(payload))
+                          return str(json.loads(response['Payload'].read().decode('utf-8')))
+                      except Exception as e:
+                          return f"Error executing stop_dms/post: {str(e)}"
+                  
+                  @tool()
+                  def dms_actions_check_status_post() -> str:
+                      lambda_client = boto3.client('lambda', region_name=REGION)
+                      try:
+                          payload = {"messageVersion": "1.0", "agent": {"name": "dms_management_agent", "id": "AGENTCORE", "alias": "LATEST", "version": "DRAFT"}, "sessionId": "", "sessionAttributes": {}, "promptSessionAttributes": {}, "actionGroup": "dms_actions", "apiPath": "/check-status", "inputText": last_input, "httpMethod": "POST", "parameters": []}
+                          response = lambda_client.invoke(FunctionName=LAMBDA_ARN, InvocationType='RequestResponse', Payload=json.dumps(payload))
+                          return str(json.loads(response['Payload'].read().decode('utf-8')))
+                      except Exception as e:
+                          return f"Error executing check_status/post: {str(e)}"
+                  
+                  class DmsActionsValidateDataPostApplicationJson(BaseModel):
+                      content_type_annotation: Literal["application/json"]
+                      table_name: Optional[str] = Field(None, description="Specific table name to validate (optional - validates all tables if not provided)")
+                      source_database: Optional[str] = Field(None, description="Source database name (optional - uses database from secrets if not provided)")
+                  
+                  @tool(inputSchema=DmsActionsValidateDataPostApplicationJson.model_json_schema())
+                  def dms_actions_validate_data_post(content_type_annotation: str, table_name: Optional[str] = None, source_database: Optional[str] = None) -> str:
+                      lambda_client = boto3.client('lambda', region_name=REGION)
+                      model_dump = {"content_type_annotation": content_type_annotation}
+                      if table_name:
+                          model_dump["table_name"] = table_name
+                      if source_database:
+                          model_dump["source_database"] = source_database
+                      request_body = {"content": {"application/json": {"properties": []}}}
+                      for param_name, param_value in model_dump.items():
+                          if param_name != "content_type_annotation":
+                              request_body["content"]["application/json"]["properties"].append({"name": param_name, "value": param_value})
+                      try:
+                          payload = {"messageVersion": "1.0", "agent": {"name": "dms_management_agent", "id": "AGENTCORE", "alias": "LATEST", "version": "DRAFT"}, "sessionId": "", "sessionAttributes": {}, "promptSessionAttributes": {}, "actionGroup": "dms_actions", "apiPath": "/validate-data", "inputText": last_input, "httpMethod": "POST", "parameters": [], "requestBody": request_body}
+                          response = lambda_client.invoke(FunctionName=LAMBDA_ARN, InvocationType='RequestResponse', Payload=json.dumps(payload))
+                          return str(json.loads(response['Payload'].read().decode('utf-8')))
+                      except Exception as e:
+                          return f"Error executing validate_data/post: {str(e)}"
+                  
+                  action_group_tools = [dms_actions_start_dms_post, dms_actions_stop_dms_post, dms_actions_check_status_post, dms_actions_validate_data_post]
+                  checkpointer_STM = SlidingWindowConversationManager()
+                  tools = []
+                  tools_used = set()
+                  strands_telemetry = StrandsTelemetry()
+                  strands_telemetry.setup_meter(enable_console_exporter=True)
+                  strands_telemetry.setup_console_exporter()
+                  tools += action_group_tools
+                  _agent = None
+                  first_turn = True
+                  last_input = ""
+                  user_id = ""
+                  
+                  def get_agent():
+                      global _agent
+                      if _agent is None:
+                          _agent = Agent(model=llm_ORCHESTRATION, system_prompt=ORCHESTRATION_TEMPLATE, tools=tools, conversation_manager=checkpointer_STM)
+                      return _agent
+                  
+                  def invoke_agent(question: str):
+                      global last_input
+                      last_input = question
+                      agent = get_agent()
+                      original_stdout = sys.stdout
+                      sys.stdout = io.StringIO()
+                      response = agent(question)
+                      sys.stdout = original_stdout
+                      return response
+                  
+                  @app.entrypoint
+                  def endpoint(payload, context):
+                      try:
+                          session_id = context.session_id or payload.get("sessionId", uuid.uuid4().hex[:8])
+                          tools_used.clear()
+                          agent_query = payload.get("message", "")
+                          if not agent_query:
+                              return {'error': "No query provided, please provide a 'message' field in the payload."}
+                          agent_result = invoke_agent(agent_query)
+                          tools_used.update(list(agent_result.metrics.tool_metrics.keys()))
+                          response_content = str(agent_result)
+                          sources = []
+                          urls = re.findall('(?:https?://|www\\.)(?:[a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,}(?:/[^/\\s]*)*', response_content)
+                          source_tags = re.findall(r"<source>(.*?)</source>", response_content)
+                          sources.extend(urls)
+                          sources.extend(source_tags)
+                          sources = list(set(sources))
+                          formatted_messages = [(agent_query, "USER"), (response_content if response_content else "No Response.", "ASSISTANT")]
+                          return {'result': {'response': response_content, 'sources': sources, 'tools_used': list(tools_used), 'sessionId': session_id, 'messages': formatted_messages}}
+                      except Exception as e:
+                          return {'error': str(e)}
+                  
+                  if __name__ == "__main__":
+                      app.run()
+                  AGENTEOF
+                
+                - |
+                  cat > Dockerfile << 'EOF'
+                  FROM public.ecr.aws/docker/library/python:3.12-slim
+                  WORKDIR /app
+                  COPY requirements.txt .
+                  RUN pip install --no-cache-dir -r requirements.txt
+                  COPY dms_agent.py .
+                  ENV AWS_REGION=$AWS_DEFAULT_REGION
+                  ENV FOUNDATION_MODEL_ID=$FOUNDATION_MODEL_ID
+                  ENV DMS_LAMBDA_ARN=$DMS_LAMBDA_ARN
+                  EXPOSE 8080
+                  CMD ["python", "dms_agent.py"]
+                  EOF
+                
+                - echo Building Docker image...
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Pushing Docker image to ECR...
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - echo Build completed successfully
+
+  AgentCoreBuildTrigger:
+    Type: Custom::CodeBuildTrigger
+    DependsOn: [AgentCoreImageBuildProject, AgentCoreCodeBuildTriggerFunction]
+    Properties:
+      ServiceToken: !GetAtt AgentCoreCodeBuildTriggerFunction.Arn
+      ProjectName: !Ref AgentCoreImageBuildProject
+
+
+  # AgentCore Runtime
+
+  DMSAgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: AgentCoreBuildTrigger
+    Properties:
+      AgentRuntimeName: !Sub 
+        - "${StackNameUnderscore}_${AgentCoreName}"
+        - StackNameUnderscore: !Join ["_", !Split ["-", !Ref "AWS::StackName"]]
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub "${AgentCoreECRRepository.RepositoryUri}:${ImageTag}"
+      RoleArn: !GetAtt AgentCoreExecutionRole.Arn
+      NetworkConfiguration:
+        NetworkMode: !Ref NetworkMode
+        VpcConfiguration: !If
+          - UsePrivateNetwork
+          - SecurityGroupIds:
+              - !Ref AgentCoreSecurityGroupId
+            SubnetIds: !Ref AgentCoreSubnetIds
+          - !Ref 'AWS::NoValue'
+      Description: !Sub "DMS Management Agent for ${AWS::StackName}"
+      EnvironmentVariables:
+        DMS_LAMBDA_ARN: !GetAtt DMSAgentLambda.Arn
+        AWS_REGION: !Ref AWS::Region
+        FOUNDATION_MODEL_ID: !If
+          - IsFullArn
+          - !Ref FoundationModelId
+          - !If
+            - IsInferenceProfile
+            - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${FoundationModelId}'
+            - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${FoundationModelId}'
+
+
+  # Observability
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${AWS::StackName}-${AgentCoreName}-build'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  DMSAgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/bedrock-agentcore/${DMSAgentRuntime.AgentRuntimeId}'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  DMSLogsDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub '${DMSAgentRuntime.AgentRuntimeId}-logs-source'
+      LogType: 'APPLICATION_LOGS'
+      ResourceArn: !GetAtt DMSAgentRuntime.AgentRuntimeArn
+    DependsOn: DMSAgentRuntime
+
+  DMSLogsDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub '${DMSAgentRuntime.AgentRuntimeId}-logs-destination'
+      DeliveryDestinationType: 'CWL'
+      DestinationResourceArn: !GetAtt DMSAgentCoreLogGroup.Arn
+
+  DMSLogsDelivery:
+    Type: AWS::Logs::Delivery
+    Properties:
+      DeliverySourceName: !Ref DMSLogsDeliverySource
+      DeliveryDestinationArn: !GetAtt DMSLogsDeliveryDestination.Arn
+    DependsOn:
+      - DMSLogsDeliverySource
+      - DMSLogsDeliveryDestination
+
+Outputs:
+  # DMS Stack Outputs
+  ReplicationInstanceArn:
+    Description: DMS Replication Instance ARN
+    Value: !If [CreateReplicationInstance, !Ref DMSReplicationInstance, !Ref ExistingReplicationInstanceArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationInstanceArn'
+  
+  SourceEndpointArn:
+    Description: DMS Source Endpoint ARN
+    Value: !Ref DMSSourceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceEndpointArn'
+  
+  TargetEndpointArn:
+    Description: DMS Target Endpoint ARN (S3)
+    Value: !Ref DMSTargetEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetEndpointArn'
+  
+  S3BucketName:
+    Description: S3 Bucket for DMS Target
+    Value: !Ref DMSS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+  
+  S3BucketArn:
+    Description: S3 Bucket ARN
+    Value: !GetAtt DMSS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+  
+  S3ProcessorFunctionName:
+    Description: S3 Processor Lambda Function Name
+    Value: !Ref DMSS3ProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-S3ProcessorFunctionName'
+  
+  S3ProcessorFunctionArn:
+    Description: S3 Processor Lambda Function ARN
+    Value: !GetAtt DMSS3ProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3ProcessorFunctionArn'
+  
+  ReplicationTaskArn:
+    Description: DMS Replication Task ARN
+    Value: !Ref DMSReplicationTask
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationTaskArn'
+
+  ReplicationTaskName:
+    Description: DMS Replication Task Name
+    Value: !Sub 'migration-task-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationTaskName' 
+  
+  # AgentCore Outputs
+  AgentRuntimeId:
+    Description: DMS AgentCore Runtime ID
+    Value: !GetAtt DMSAgentRuntime.AgentRuntimeId
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeId'
+
+  AgentRuntimeArn:
+    Description: DMS AgentCore Runtime ARN
+    Value: !GetAtt DMSAgentRuntime.AgentRuntimeArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeArn'
+
+  AgentCoreECRRepositoryUri:
+    Description: AgentCore ECR Repository URI
+    Value: !GetAtt AgentCoreECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreECRRepositoryUri'
+  
+  AgentCoreExecutionRoleArn:
+    Description: AgentCore Execution Role ARN
+    Value: !GetAtt AgentCoreExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreExecutionRoleArn'
+  
+  DMSAgentLambdaFunctionArn:
+    Description: DMS Agent Lambda Function ARN
+    Value: !GetAtt DMSAgentLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DMSAgentLambdaArn'
+  
+  DMSAgentLambdaFunctionName:
+    Description: DMS Agent Lambda Function Name
+    Value: !Ref DMSAgentLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-DMSAgentLambdaName'
+  
+  AgentCoreImageBuildProjectName:
+    Description: AgentCore CodeBuild Project Name
+    Value: !Ref AgentCoreImageBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreCodeBuildProject'
