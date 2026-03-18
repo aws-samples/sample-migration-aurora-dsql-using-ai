@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenSearch Serverless Collection, Index, and Knowledge Base IAM Role
+
+Parameters:
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+
+  DeployerPrincipalArn:
+    Type: String
+    Description: ARN of IAM user/role deploying this stack (index creation permissions)
+
+Resources:
+  # Encryption Policy
+  EncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub ${AWS::StackName}-encryption
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${AWS::StackName}-collection"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # Network Policy
+  NetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub ${AWS::StackName}-network
+      Type: network
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${AWS::StackName}-collection"]
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${AWS::StackName}-collection"]
+              }
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  # Collection
+  Collection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - EncryptionPolicy
+      - NetworkPolicy
+    Properties:
+      Name: !Sub ${AWS::StackName}-collection
+      Type: VECTORSEARCH
+      Description: Vector collection for Bedrock Knowledge Base
+
+  # Managed Policies
+  OpenSearchAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allow access to OpenSearch Serverless collection
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: aoss:APIAccessAll
+            Resource: !GetAtt Collection.Arn
+
+  BedrockModelAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allow Bedrock model invocation for embeddings
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}
+
+  # Knowledge Base IAM Role
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-kb-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref OpenSearchAccessPolicy
+        - !Ref BedrockModelAccessPolicy
+
+  # Access Policy
+  AccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    DependsOn: KnowledgeBaseRole
+    Properties:
+      Name: !Sub ${AWS::StackName}-access
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "Resource": ["collection/${AWS::StackName}-collection"],
+                "Permission": [
+                  "aoss:CreateCollectionItems",
+                  "aoss:DeleteCollectionItems",
+                  "aoss:UpdateCollectionItems",
+                  "aoss:DescribeCollectionItems"
+                ],
+                "ResourceType": "collection"
+              },
+              {
+                "Resource": ["index/${AWS::StackName}-collection/*"],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:DeleteIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument"
+                ],
+                "ResourceType": "index"
+              }
+            ],
+            "Principal": ["${KnowledgeBaseRole.Arn}", "${DeployerPrincipalArn}"]
+          }
+        ]
+
+  # Index
+  Index:
+    Type: AWS::OpenSearchServerless::Index
+    DependsOn:
+      - Collection
+      - AccessPolicy
+      - OpenSearchAccessPolicy
+      - BedrockModelAccessPolicy
+    Properties:
+      CollectionEndpoint: !GetAtt Collection.CollectionEndpoint
+      IndexName: bedrock-knowledge-base-default-index
+      Mappings:
+        Properties:
+          bedrock-knowledge-base-default-vector:
+            Type: knn_vector
+            Dimension: 1024
+            Method:
+              Engine: faiss
+              Name: hnsw
+          AMAZON_BEDROCK_TEXT:
+            Type: text
+          AMAZON_BEDROCK_METADATA:
+            Type: text
+            Index: false
+      Settings:
+        Index:
+          Knn: true
+
+Outputs:
+  CollectionArn:
+    Description: OpenSearch Collection ARN
+    Value: !GetAtt Collection.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CollectionArn
+
+  IndexName:
+    Description: OpenSearch Index Name (will be created by Bedrock during first sync)
+    Value: bedrock-knowledge-base-default-index
+    Export:
+      Name: !Sub ${AWS::StackName}-IndexName
+
+  KnowledgeBaseRoleArn:
+    Description: Knowledge Base IAM Role ARN
+    Value: !GetAtt KnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-KBRoleArn
