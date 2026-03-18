@@ -174,7 +174,7 @@ roles, and CloudWatch Logs delivery configuration for observability.
 Note: 
  
    * Make sure the source database allows incoming connection from the lambda function. If using different VPC, then VPC peering needs to be established between your source vpc and lambda function vpc.
-   * When using NetworkMode: VPC, you must create the following ![VPC endpoints](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-vpc.html#agentcore-vpc-endpoints) in your VPC before deploying the stack:
+   * When using NetworkMode: VPC, you must create the following [VPC endpoints](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-vpc.html#agentcore-vpc-endpoints) in your VPC before deploying the stack:
 
      1. com.amazonaws.{region}.bedrock-runtime - Invoke foundation models
      2. com.amazonaws.{region}.bedrock-agent-runtime - Knowledge Base retrieval
