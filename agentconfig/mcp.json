@@ -1,0 +1,71 @@
+{
+  "mcpServers": {
+    "awslabs.aws-diagram-mcp-server": {
+      "args": [
+        "awslabs.aws-diagram-mcp-server"
+      ],
+      "autoApprove": [],
+      "command": "uvx",
+      "disabled": false,
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    },
+    "awslabs.aws-documentation-mcp-server": {
+      "args": [
+        "awslabs.aws-documentation-mcp-server@latest"
+      ],
+      "autoApprove": [],
+      "command": "uvx",
+      "disabled": false,
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    },
+    "awslabs.aws-pricing-mcp-server": {
+      "args": [
+        "awslabs.aws-pricing-mcp-server@latest"
+      ],
+      "autoApprove": [],
+      "command": "uvx",
+      "disabled": false,
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    },
+    "awslabs.cfn-mcp-server": {
+      "args": [
+        "awslabs.cfn-mcp-server@latest"
+      ],
+      "autoApprove": [],
+      "command": "uvx",
+      "disabled": false,
+      "env": {
+        "AWS_PROFILE": "default"
+      }
+    },
+    "awslabs.aurora-dsql-mcp-server": {
+      "args": [
+        "awslabs.aurora-dsql-mcp-server@latest",
+        "--cluster_endpoint", "<your-cluster-endpoint",
+        "--region", "<your-cluster-region>",
+        "--database_user", "<Db-user>",
+        "--allow-writes",
+        "--profile", "default"
+      ],
+      "disabled": false,
+      "command": "uvx",
+      "autoApprove": [],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    }
+  },
+  "tools": [
+    "@awslabs.aws-documentation-mcp-server",
+    "@awslabs.cfn-mcp-server",
+    "@awslabs.aws-diagram-mcp-server",
+    "@awslabs.aws-pricing-mcp-server",
+    "@awslabs.aurora-dsql-mcp-server"
+  ]
+}
