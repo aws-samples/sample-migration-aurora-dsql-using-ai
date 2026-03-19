@@ -155,6 +155,7 @@ repository, a CodeBuild project to build and push the agent Docker image, a Bedr
 roles, and CloudWatch Logs delivery configuration for observability.
 
    Download the CloudFormation template: [cfn-agentcore-analyze-kb.yaml](./deployment/templates/cfn-agentcore-analyze-kb.yaml)
+
    Create the CloudFormation stack with the below parameters
    
        - VPC ID, Subnet ID, and Security Group ID for Lambda functions
