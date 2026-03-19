@@ -49,7 +49,7 @@ To use the Aurora DSQL Migration Assistant, you need:
 Download the project to your home folder by executing the following command:
 
 ```
-git clone https://gitlab.aws.dev/noorulmu/dsql-migration-using-ai.git
+git clone https://github.com/aws-samples/sample-migration-aurora-dsql-using-ai.git
 
 ```
 
