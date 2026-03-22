@@ -525,7 +525,7 @@ def get_primary_keys(table_name: str, token: str) -> List[str]:
         conn.close()
         
         if not primary_keys:
-            error_msg = f"No primary key found for table"
+            error_msg = "No primary key found for table"
             logger.error(error_msg)
             raise ValueError(error_msg)
         
