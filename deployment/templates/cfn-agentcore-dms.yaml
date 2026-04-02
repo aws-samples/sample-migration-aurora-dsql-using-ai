@@ -610,7 +610,6 @@ Resources:
         CompressionType: gzip
         EnableStatistics: true
         IncludeOpForFullLoad: true
-        CdcInsertsAndUpdates: true
         TimestampColumnName: dms_timestamp
         AddColumnName: true
         CdcPath: 'cdc'
