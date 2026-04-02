@@ -299,7 +299,7 @@ def process_csv_file(bucket: str, key: str, token: str) -> None:
             return
         
         initialize_table_columns_once(table_name, token)
-        is_full_load = '/LOAD' in key or not '/cdc/' in key
+        is_full_load = '/LOAD' in key or not 'cdc' in key
         
         # CSV has headers with AddColumnName=true
         csv_reader = csv.DictReader(file_content.splitlines())
