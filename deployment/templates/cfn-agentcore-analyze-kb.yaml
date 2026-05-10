@@ -670,7 +670,7 @@ Resources:
                       temperature=0,
                       max_tokens=55000,
                       stop_sequences=['</answer>'],
-                      top_k=250
+                      top_k=50
                   )
                   
                   ORCHESTRATION_TEMPLATE = """
