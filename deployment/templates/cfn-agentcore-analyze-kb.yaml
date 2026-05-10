@@ -693,7 +693,10 @@ Resources:
                      - Reference the knowledge base for:
                        - Aurora DSQL supported data types
                        - Conversion recommendations
-                       - Always use Correct Aurora DSQL syntax for tables, for index such as using Async, for sequence using CACHE parameter and right syntax for other database objects
+                     MANDATORY AURORA DSQL SYNTAX RULES (apply to every converted DDL):
+                     - Always use Correct Aurora DSQL syntax for tables, for index such as using Async, for sequence using CACHE parameter and right syntax for other database objects
+                     - Do NOT return a converted DDL without applying these rules
+
                   
                   3. Important Considrations:
                      - Do NOT assume general PostgreSQL compatibility equals Aurora DSQL compatibility
